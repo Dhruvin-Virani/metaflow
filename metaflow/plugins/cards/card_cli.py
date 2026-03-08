@@ -14,7 +14,13 @@ import os
 import time
 import json
 import uuid
-import signal
+import sys
+
+if sys.platform == "win32":
+    import ctypes
+    import threading
+else:
+    import signal
 import random
 from contextlib import contextmanager
 from functools import wraps
@@ -160,17 +166,36 @@ def resolve_card(
 
 @contextmanager
 def timeout(time):
-    # Register a function to raise a TimeoutError on the signal.
-    signal.signal(signal.SIGALRM, raise_timeout)
-    # Schedule the signal to be sent after ``time``.
-    signal.alarm(time)
+    if sys.platform == "win32":
+        # SIGALRM is not available on Windows; use a daemon thread timer
+        timed_out = [False]
+        main_thread_id = threading.main_thread().ident
 
-    try:
-        yield
-    finally:
-        # Unregister the signal so that it won't be triggered
-        # if the timeout is not reached.
-        signal.signal(signal.SIGALRM, signal.SIG_IGN)
+        def _raise_in_main():
+            timed_out[0] = True
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(main_thread_id), ctypes.py_object(TimeoutError)
+            )
+
+        timer = threading.Timer(time, _raise_in_main)
+        timer.daemon = True
+        timer.start()
+        try:
+            yield
+        finally:
+            timer.cancel()
+    else:
+        # Register a function to raise a TimeoutError on the signal.
+        signal.signal(signal.SIGALRM, raise_timeout)
+        # Schedule the signal to be sent after ``time``.
+        signal.alarm(time)
+
+        try:
+            yield
+        finally:
+            # Unregister the signal so that it won't be triggered
+            # if the timeout is not reached.
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)
 
 
 def raise_timeout(signum, frame):

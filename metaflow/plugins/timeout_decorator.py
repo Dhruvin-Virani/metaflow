@@ -1,10 +1,16 @@
-import signal
+import sys
 import traceback
 
 from metaflow.exception import MetaflowException
 from metaflow.decorators import StepDecorator
 from metaflow.unbounded_foreach import UBF_CONTROL
 from metaflow.metaflow_config import DEFAULT_RUNTIME_LIMIT
+
+if sys.platform == "win32":
+    import ctypes
+    import threading
+else:
+    import signal
 
 
 class TimeoutException(MetaflowException):
@@ -70,13 +76,31 @@ class TimeoutDecorator(StepDecorator):
         if ubf_context != UBF_CONTROL and retry_count <= max_user_code_retries:
             # enable timeout only when executing user code
             self.step_name = step_name
-            signal.signal(signal.SIGALRM, self._sigalrm_handler)
-            signal.alarm(self.secs)
+            if sys.platform == "win32":
+                # SIGALRM is not available on Windows; use a daemon thread timer
+                self._main_thread_id = threading.main_thread().ident
+                self._timer = threading.Timer(self.secs, self._timeout_handler)
+                self._timer.daemon = True
+                self._timer.start()
+            else:
+                signal.signal(signal.SIGALRM, self._sigalrm_handler)
+                signal.alarm(self.secs)
 
     def task_post_step(
         self, step_name, flow, graph, retry_count, max_user_code_retries
     ):
-        signal.alarm(0)
+        if sys.platform == "win32":
+            if hasattr(self, "_timer"):
+                self._timer.cancel()
+        else:
+            signal.alarm(0)
+
+    def _timeout_handler(self):
+        """Windows fallback: raise TimeoutException in the main thread via ctypes."""
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(self._main_thread_id),
+            ctypes.py_object(TimeoutException(self._format_timeout_msg())),
+        )
 
     def _sigalrm_handler(self, signum, frame):
         def pretty_print_stack():
@@ -85,16 +109,19 @@ class TimeoutDecorator(StepDecorator):
                     for part in line.splitlines():
                         yield ">  %s" % part
 
-        msg = (
-            "Step {step_name} timed out after {hours} hours, "
-            "{minutes} minutes, {seconds} seconds".format(
-                step_name=self.step_name, **self.attributes
-            )
-        )
+        msg = self._format_timeout_msg()
         self.logger(msg)
         raise TimeoutException(
             "%s\nStack when the timeout was raised:\n%s"
             % (msg, "\n".join(pretty_print_stack()))
+        )
+
+    def _format_timeout_msg(self):
+        return (
+            "Step {step_name} timed out after {hours} hours, "
+            "{minutes} minutes, {seconds} seconds".format(
+                step_name=self.step_name, **self.attributes
+            )
         )
 
 
